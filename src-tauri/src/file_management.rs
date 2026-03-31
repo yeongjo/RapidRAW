@@ -2213,15 +2213,18 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
     let (source_path, sidecar_path) = parse_virtual_path(&path);
-    let mut metadata: ImageMetadata = if sidecar_path.exists() {
+    let sidecar_existed = sidecar_path.exists();
+    let mut metadata: ImageMetadata = if sidecar_existed {
         let file_content = fs::read_to_string(&sidecar_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&file_content).unwrap_or_default()
     } else {
         ImageMetadata::default()
     };
 
-    if enable_xmp_sync
-        && sync_metadata_from_xmp(&source_path, &mut metadata)
+    let xmp_changed = (!sidecar_existed || enable_xmp_sync)
+        && sync_metadata_from_xmp(&source_path, &mut metadata);
+
+    if xmp_changed
         && let Ok(json) = serde_json::to_string_pretty(&metadata)
     {
         let _ = fs::write(&sidecar_path, json);
@@ -3075,18 +3078,24 @@ pub fn extract_xmp_tags(content: &str) -> Vec<String> {
 pub fn sync_metadata_from_xmp(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
     let xmp_path = source_path.with_extension("xmp");
     let xmp_path_upper = source_path.with_extension("XMP");
-    let actual_xmp = if xmp_path.exists() {
-        Some(xmp_path)
-    } else if xmp_path_upper.exists() {
-        Some(xmp_path_upper)
-    } else {
-        None
-    };
 
     let mut changed = false;
 
-    if let Some(xmp_file) = actual_xmp
-        && let Ok(content) = fs::read_to_string(&xmp_file)
+    let content_opt: Option<String> = if xmp_path.exists() {
+        fs::read_to_string(&xmp_path).ok()
+    } else if xmp_path_upper.exists() {
+        fs::read_to_string(&xmp_path_upper).ok()
+    } else {
+        (|| {
+            let bytes = fs::read(source_path).ok()?;
+            let start = bytes.windows(16).position(|w| w == b"<?xpacket begin=")?;
+            let end = start + bytes[start..].windows(14).position(|w| w == b"<?xpacket end=")?;
+            let close = end + bytes[end..].windows(2).position(|w| w == b"?>")?;
+            String::from_utf8(bytes[start..close + 2].to_vec()).ok()
+        })()
+    };
+
+    if let Some(content) = content_opt
     {
         if metadata.rating == 0
             && let Some(rating) = extract_xmp_rating(&content)
