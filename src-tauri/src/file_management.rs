@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -2221,12 +2221,9 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
         ImageMetadata::default()
     };
 
-    let xmp_changed = (!sidecar_existed || enable_xmp_sync)
-        && sync_metadata_from_xmp(&source_path, &mut metadata);
+    let xmp_changed = enable_xmp_sync && sync_metadata_from_xmp(&source_path, &mut metadata);
 
-    if xmp_changed
-        && let Ok(json) = serde_json::to_string_pretty(&metadata)
-    {
+    if xmp_changed && let Ok(json) = serde_json::to_string_pretty(&metadata) {
         let _ = fs::write(&sidecar_path, json);
     }
 
@@ -3075,6 +3072,71 @@ pub fn extract_xmp_tags(content: &str) -> Vec<String> {
     tags
 }
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn read_embedded_xmp_packet(source_path: &Path) -> Option<String> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    const MAX_XMP_PACKET_SIZE: usize = 16 * 1024 * 1024;
+    const XMP_START: &[u8] = b"<?xpacket begin=";
+    const XMP_END: &[u8] = b"<?xpacket end=";
+    const XMP_CLOSE: &[u8] = b"?>";
+
+    let mut file = fs::File::open(source_path).ok()?;
+    let mut chunk = vec![0; CHUNK_SIZE];
+    let mut pending = Vec::new();
+    let mut packet: Option<Vec<u8>> = None;
+
+    loop {
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+
+        if let Some(packet_bytes) = packet.as_mut() {
+            packet_bytes.extend_from_slice(&chunk[..read]);
+            if packet_bytes.len() > MAX_XMP_PACKET_SIZE {
+                return None;
+            }
+
+            if let Some(end_idx) = find_bytes(packet_bytes, XMP_END)
+                && let Some(close_idx) = find_bytes(&packet_bytes[end_idx..], XMP_CLOSE)
+            {
+                let packet_end = end_idx + close_idx + XMP_CLOSE.len();
+                packet_bytes.truncate(packet_end);
+                return String::from_utf8(std::mem::take(packet_bytes)).ok();
+            }
+        } else {
+            pending.extend_from_slice(&chunk[..read]);
+            if let Some(start_idx) = find_bytes(&pending, XMP_START) {
+                let mut packet_bytes = pending.split_off(start_idx);
+                pending.clear();
+
+                if let Some(end_idx) = find_bytes(&packet_bytes, XMP_END)
+                    && let Some(close_idx) = find_bytes(&packet_bytes[end_idx..], XMP_CLOSE)
+                {
+                    let packet_end = end_idx + close_idx + XMP_CLOSE.len();
+                    packet_bytes.truncate(packet_end);
+                    return String::from_utf8(packet_bytes).ok();
+                }
+
+                if packet_bytes.len() > MAX_XMP_PACKET_SIZE {
+                    return None;
+                }
+                packet = Some(packet_bytes);
+            } else {
+                let keep = XMP_START.len().saturating_sub(1);
+                if pending.len() > keep {
+                    pending.drain(..pending.len() - keep);
+                }
+            }
+        }
+    }
+}
+
 pub fn sync_metadata_from_xmp(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
     let xmp_path = source_path.with_extension("xmp");
     let xmp_path_upper = source_path.with_extension("XMP");
@@ -3086,17 +3148,10 @@ pub fn sync_metadata_from_xmp(source_path: &Path, metadata: &mut ImageMetadata) 
     } else if xmp_path_upper.exists() {
         fs::read_to_string(&xmp_path_upper).ok()
     } else {
-        (|| {
-            let bytes = fs::read(source_path).ok()?;
-            let start = bytes.windows(16).position(|w| w == b"<?xpacket begin=")?;
-            let end = start + bytes[start..].windows(14).position(|w| w == b"<?xpacket end=")?;
-            let close = end + bytes[end..].windows(2).position(|w| w == b"?>")?;
-            String::from_utf8(bytes[start..close + 2].to_vec()).ok()
-        })()
+        read_embedded_xmp_packet(source_path)
     };
 
-    if let Some(content) = content_opt
-    {
+    if let Some(content) = content_opt {
         if metadata.rating == 0
             && let Some(rating) = extract_xmp_rating(&content)
             && rating != 0
